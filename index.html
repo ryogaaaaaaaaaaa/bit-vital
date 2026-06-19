@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Bit Vitals — M0 Mock</title>
+<style>
+  :root{ --bg:#070b13; }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ width:100%; height:100%; background:var(--bg); overflow:hidden; }
+  body{ touch-action:none; -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent;
+        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  #wrap{ position:fixed; inset:0; }
+  canvas{ display:block; width:100%; height:100%; touch-action:none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+(() => {
+  'use strict';
+
+  // ===== チューニングノブ（ここを触れば手触りが変わる）=====
+  const CFG = {
+    playerSpeed:235, playerMaxHp:100, playerRadius:14,
+    dashSpeed:760, dashTime:0.13, dashCd:1.1, dashIframe:0.20,
+    fireInterval:0.34, bulletSpeed:640, bulletDmg:26, bulletRadius:5, bulletLife:1.1,
+    pickupRadius:22, magnetRadius:95, magnetSpeed:340,
+    commonValue:1, rareValue:5, rareChance:0.16, dropChance:0.62,
+    enemyBaseHp:30, enemyBaseSpeed:72, enemyRadius:13, enemyContactDmg:15, enemyHitCd:0.55,
+    spawnBase:1.15,          // risk0 のときの 体/秒
+    riskTimeToMax:105,       // 時間だけで最大Riskに届く秒数
+    rareRiskAdd:0.06,        // レア1個あたりのRisk上げ幅(0..1)
+    hunterStage:4, hunterSpeedMul:1.5, hunterHpMul:2.4,
+    channelTime:3.0, channelHitPenalty:0.55, lossRatio:0.8,
+  };
+  const COL = {
+    player:'#eaf2ff', bullet:'#46e0ff', common:'#46e0ff', rare:'#ffd34d',
+    enemy:'#ff5a52', hunter:'#ff5cf0', grid:'rgba(110,190,255,0.06)',
+    good:'#46f08a', bad:'#ff5a52', warn:'#ffd34d',
+  };
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  let W=0, H=0, DPR=1;
+  function resize(){
+    const r = canvas.parentElement.getBoundingClientRect();
+    DPR = Math.min(window.devicePixelRatio||1, 2);
+    W = Math.max(1, r.width); H = Math.max(1, r.height);
+    canvas.width = Math.floor(W*DPR); canvas.height = Math.floor(H*DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    if(G.mode==='playing'){ G.px=clamp(G.px,40,W-40); G.py=clamp(G.py,40,H-40); }
+  }
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', ()=>setTimeout(resize,200));
+
+  const clamp=(v,a,b)=>v<a?a:(v>b?b:v);
+  const hypot=Math.hypot;
+
+  // ===== 永続データ（セッションのキャリア）=====
+  let store = { total:0, best:0 };
+  try{ const s=JSON.parse(localStorage.getItem('bitvitals_m0')||'{}'); if(s&&typeof s==='object'){ store.total=+s.total||0; store.best=+s.best||0; } }catch(e){}
+  function save(){ try{ localStorage.setItem('bitvitals_m0', JSON.stringify(store)); }catch(e){} }
+
+  // ===== ゲーム状態 =====
+  const G = {
+    mode:'title', // 'title' | 'playing' | 'result'
+    outcome:'', thisBanked:0, thisLost:0,
+    px:0, py:0, hp:CFG.playerMaxHp, unbanked:0,
+    riskT:0, stage:0, maxStage:0, survival:0,
+    fireAcc:0, spawnAcc:0,
+    dashT:0, iframeT:0, dashCdT:0, dashDir:{x:1,y:0}, lastDir:{x:1,y:0},
+    channel:0, shake:0, hurtFlash:0,
+    enemies:[], bullets:[], pickups:[], popups:[], parts:[],
+  };
+
+  function startRun(){
+    G.mode='playing'; G.outcome=''; G.thisBanked=0; G.thisLost=0;
+    G.px=W/2; G.py=H/2; G.hp=CFG.playerMaxHp; G.unbanked=0;
+    G.riskT=0; G.stage=0; G.maxStage=0; G.survival=0;
+    G.fireAcc=0; G.spawnAcc=0; G.dashT=0; G.iframeT=0; G.dashCdT=0;
+    G.channel=0; G.shake=0; G.hurtFlash=0;
+    G.enemies.length=0; G.bullets.length=0; G.pickups.length=0; G.popups.length=0; G.parts.length=0;
+    ensureAudio();
+  }
+
+  // ===== 入力（Pointer Events で マウス/タッチ統一）=====
+  const keys = {};
+  const joy = { active:false, ox:0, oy:0, x:0, y:0 };       // 仮想スティック（左）
+  const pointers = new Map();                                // id -> role
+  const MAXR = 64;
+
+  function btnGeom(){
+    const r1 = clamp(Math.min(W,H)*0.11, 50, 86);            // EXTRACT
+    const r2 = r1*0.7;                                       // DASH
+    const ex = W - 26 - r1, ey = H - 26 - r1;
+    const dx = ex, dy = ey - r1 - r2 - 16;
+    return { ex,ey,r1, dx,dy,r2 };
+  }
+  function inCircle(x,y,cx,cy,r){ const a=x-cx,b=y-cy; return a*a+b*b<=r*r; }
+  function getPos(e){ const r=canvas.getBoundingClientRect(); return { x:e.clientX-r.left, y:e.clientY-r.top }; }
+
+  canvas.addEventListener('pointerdown', (e)=>{
+    e.preventDefault(); ensureAudio();
+    const p=getPos(e); const g=btnGeom();
+    if(G.mode!=='playing'){ startRun(); }   // タイトル/リザルトはタップで開始
+    // ボタン判定
+    if(inCircle(p.x,p.y,g.ex,g.ey,g.r1*1.15)){ pointers.set(e.pointerId,'extract'); }
+    else if(inCircle(p.x,p.y,g.dx,g.dy,g.r2*1.2)){ pointers.set(e.pointerId,'dash'); tryDash(); }
+    else { pointers.set(e.pointerId,'move'); joy.active=true; joy.ox=p.x; joy.oy=p.y; joy.x=0; joy.y=0; }
+    try{ canvas.setPointerCapture(e.pointerId); }catch(_){}
+  });
+  canvas.addEventListener('pointermove', (e)=>{
+    const role=pointers.get(e.pointerId); if(!role) return;
+    const p=getPos(e);
+    if(role==='move'){
+      let vx=p.x-joy.ox, vy=p.y-joy.oy; const len=hypot(vx,vy);
+      if(len>MAXR){ vx=vx/len*MAXR; vy=vy/len*MAXR; }
+      joy.x=vx/MAXR; joy.y=vy/MAXR;
+    }
+  });
+  function endPointer(e){
+    const role=pointers.get(e.pointerId); if(!role) return;
+    pointers.delete(e.pointerId);
+    if(role==='move'){ joy.active=false; joy.x=0; joy.y=0; }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  window.addEventListener('keydown',(e)=>{
+    const k=e.key.toLowerCase();
+    if(G.mode!=='playing' && (k===' '||k==='enter')){ startRun(); e.preventDefault(); return; }
+    if(k==='w'||k==='arrowup')keys.up=1; if(k==='s'||k==='arrowdown')keys.down=1;
+    if(k==='a'||k==='arrowleft')keys.left=1; if(k==='d'||k==='arrowright')keys.right=1;
+    if(k==='e')keys.e=1;
+    if(k===' '||k==='shift')tryDash();
+  });
+  window.addEventListener('keyup',(e)=>{
+    const k=e.key.toLowerCase();
+    if(k==='w'||k==='arrowup')keys.up=0; if(k==='s'||k==='arrowdown')keys.down=0;
+    if(k==='a'||k==='arrowleft')keys.left=0; if(k==='d'||k==='arrowright')keys.right=0;
+    if(k==='e')keys.e=0;
+  });
+
+  function computeDir(){
+    let x=(keys.right?1:0)-(keys.left?1:0), y=(keys.down?1:0)-(keys.up?1:0);
+    if(x===0&&y===0 && joy.active){ x=joy.x; y=joy.y; }
+    const len=hypot(x,y);
+    if(len>1){ x/=len; y/=len; } else if(len<0.14){ x=0; y=0; }
+    return {x,y};
+  }
+  function extractHeld(){
+    if(keys.e) return true;
+    for(const r of pointers.values()) if(r==='extract') return true;
+    return false;
+  }
+  function tryDash(){
+    if(G.mode!=='playing'||G.dashCdT>0) return;
+    const d=computeDir(); const dir=(d.x||d.y)?d:G.lastDir;
+    const len=hypot(dir.x,dir.y)||1; G.dashDir={x:dir.x/len,y:dir.y/len};
+    G.dashT=CFG.dashTime; G.iframeT=CFG.dashIframe; G.dashCdT=CFG.dashCd; sfx('dash');
+  }
+
+  // ===== 音（Web Audio・最初のタップで初期化）=====
+  let actx=null;
+  function ensureAudio(){ if(actx) return; try{ actx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ actx=null; } if(actx&&actx.state==='suspended') actx.resume(); }
+  function tone(f,dur,type='square',vol=0.12,slideTo=null){
+    if(!actx) return;
+    try{
+      const o=actx.createOscillator(), g=actx.createGain(); const t=actx.currentTime;
+      o.type=type; o.frequency.setValueAtTime(f,t);
+      if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo,t+dur);
+      g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+      o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t+dur);
+    }catch(e){}
+  }
+  function sfx(n){
+    if(n==='common') tone(660,0.06,'square',0.07);
+    else if(n==='rare') tone(740,0.18,'triangle',0.12,1320);
+    else if(n==='hit') tone(150,0.12,'sawtooth',0.16,70);
+    else if(n==='dash') tone(420,0.07,'sine',0.06,620);
+    else if(n==='bank'){ tone(523,0.10,'triangle',0.14); setTimeout(()=>tone(784,0.18,'triangle',0.14),90); setTimeout(()=>tone(1046,0.22,'triangle',0.13),190); }
+    else if(n==='death') tone(330,0.5,'sawtooth',0.18,60);
+  }
+
+  // ===== ヘルパ =====
+  function popup(text,x,y,color){ G.popups.push({x,y,vy:-42,life:0.8,max:0.8,text,color}); }
+  function burst(x,y,color,n){ for(let i=0;i<n;i++){ const a=Math.random()*6.283,s=60+Math.random()*160; G.parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:0.5,max:0.5,color}); } }
+
+  function spawnEnemy(isHunter){
+    const m=40; let x,y; const side=(Math.random()*4)|0;
+    if(side===0){x=-m;y=Math.random()*H;} else if(side===1){x=W+m;y=Math.random()*H;}
+    else if(side===2){x=Math.random()*W;y=-m;} else {x=Math.random()*W;y=H+m;}
+    const hpMul=1+G.riskT*1.4;
+    const e={ x,y, r:isHunter?CFG.enemyRadius*1.25:CFG.enemyRadius, hunter:!!isHunter,
+      hp:(isHunter?CFG.enemyBaseHp*CFG.hunterHpMul:CFG.enemyBaseHp)*hpMul,
+      spd:(isHunter?CFG.enemyBaseSpeed*CFG.hunterSpeedMul:CFG.enemyBaseSpeed)*(1+G.riskT*0.6),
+      hitCd:0, flash:0 };
+    G.enemies.push(e);
+  }
+  function killEnemy(j){
+    const e=G.enemies[j]; burst(e.x,e.y,e.hunter?COL.hunter:COL.enemy,e.hunter?14:8);
+    if(Math.random()<CFG.dropChance){ const rare=Math.random()<CFG.rareChance; G.pickups.push({x:e.x,y:e.y,value:rare?CFG.rareValue:CFG.commonValue,rare,t:0}); }
+    G.enemies.splice(j,1);
+  }
+  function collect(p){
+    G.unbanked+=p.value; popup('+'+p.value,p.x,p.y,p.rare?COL.rare:COL.common);
+    if(p.rare){ G.riskT=Math.min(1,G.riskT+CFG.rareRiskAdd); sfx('rare'); } else sfx('common');
+  }
+  function damagePlayer(d){
+    if(G.iframeT>0) return; G.hp-=d; G.shake=Math.min(18,G.shake+8); G.hurtFlash=0.14;
+    G.channel=Math.max(0,G.channel-CFG.channelHitPenalty); sfx('hit');
+    if(G.hp<=0){ G.hp=0; die(); }
+  }
+  function bank(){
+    G.thisBanked=G.unbanked; store.total+=G.unbanked; if(G.unbanked>store.best) store.best=G.unbanked; save();
+    burst(G.px,G.py,COL.good,26); sfx('bank'); G.outcome='banked'; G.mode='result';
+  }
+  function die(){
+    G.thisLost=Math.round(G.unbanked*CFG.lossRatio); const kept=G.unbanked-G.thisLost;
+    G.thisBanked=kept; store.total+=kept; save();
+    burst(G.px,G.py,COL.bad,30); G.shake=22; sfx('death'); G.outcome='dead'; G.mode='result';
+  }
+
+  // ===== 更新 =====
+  function update(dt){
+    if(G.mode!=='playing') return;
+    G.survival+=dt;
+    // Risk（時間で上昇／レアでも上昇）
+    G.riskT=Math.min(1,G.riskT+dt/CFG.riskTimeToMax);
+    G.stage=Math.min(5,Math.floor(G.riskT*5));
+    if(G.stage>G.maxStage) G.maxStage=G.stage;
+
+    // プレイヤー移動・ダッシュ
+    const dir=computeDir(); if(dir.x||dir.y) G.lastDir=dir;
+    G.dashT-=dt; G.iframeT-=dt; G.dashCdT-=dt;
+    let vx,vy;
+    if(G.dashT>0){ vx=G.dashDir.x*CFG.dashSpeed; vy=G.dashDir.y*CFG.dashSpeed; }
+    else { vx=dir.x*CFG.playerSpeed; vy=dir.y*CFG.playerSpeed; }
+    G.px=clamp(G.px+vx*dt, CFG.playerRadius+6, W-CFG.playerRadius-6);
+    G.py=clamp(G.py+vy*dt, CFG.playerRadius+6, H-CFG.playerRadius-6);
+
+    // 自動発射
+    G.fireAcc-=dt;
+    if(G.fireAcc<=0 && G.enemies.length){
+      let best=null,bd=1e9;
+      for(const e of G.enemies){ const dx=e.x-G.px,dy=e.y-G.py,d=dx*dx+dy*dy; if(d<bd){bd=d;best=e;} }
+      if(best){ const a=Math.atan2(best.y-G.py,best.x-G.px);
+        G.bullets.push({x:G.px,y:G.py,vx:Math.cos(a)*CFG.bulletSpeed,vy:Math.sin(a)*CFG.bulletSpeed,life:CFG.bulletLife});
+        G.fireAcc=CFG.fireInterval; }
+    }
+
+    // スポーン（脱出中は増援）
+    const channeling=extractHeld();
+    G.spawnAcc+=dt;
+    const rate=CFG.spawnBase*(1+G.riskT*3.6)*(channeling?1.7:1);
+    const interval=1/rate;
+    while(G.spawnAcc>=interval){ G.spawnAcc-=interval;
+      const hunterOk=G.stage>=CFG.hunterStage;
+      const isHunter=hunterOk&&Math.random()<(channeling?0.5:0.25);
+      spawnEnemy(isHunter);
+      if(G.enemies.length>150) break;
+    }
+
+    // 弾 & 命中
+    for(let i=G.bullets.length-1;i>=0;i--){
+      const b=G.bullets[i]; b.x+=b.vx*dt; b.y+=b.vy*dt; b.life-=dt;
+      if(b.life<=0||b.x<-20||b.x>W+20||b.y<-20||b.y>H+20){ G.bullets.splice(i,1); continue; }
+      for(let j=G.enemies.length-1;j>=0;j--){
+        const e=G.enemies[j],dx=e.x-b.x,dy=e.y-b.y,rr=e.r+CFG.bulletRadius;
+        if(dx*dx+dy*dy<=rr*rr){ e.hp-=CFG.bulletDmg; e.flash=0.08; G.bullets.splice(i,1); if(e.hp<=0) killEnemy(j); break; }
+      }
+    }
+    // 敵 移動 & 接触
+    for(let i=G.enemies.length-1;i>=0;i--){
+      const e=G.enemies[i]; e.hitCd-=dt; if(e.flash>0)e.flash-=dt;
+      const dx=G.px-e.x,dy=G.py-e.y,d=hypot(dx,dy)||1;
+      e.x+=dx/d*e.spd*dt; e.y+=dy/d*e.spd*dt;
+      if(d<=e.r+CFG.playerRadius && e.hitCd<=0 && G.iframeT<=0){ damagePlayer(CFG.enemyContactDmg); e.hitCd=CFG.enemyHitCd; }
+    }
+    // 素材 磁力 & 回収
+    for(let i=G.pickups.length-1;i>=0;i--){
+      const p=G.pickups[i]; p.t+=dt; const dx=G.px-p.x,dy=G.py-p.y,d=hypot(dx,dy)||1;
+      if(d<CFG.magnetRadius){ const s=CFG.magnetSpeed*(1-d/CFG.magnetRadius*0.35); p.x+=dx/d*s*dt; p.y+=dy/d*s*dt; }
+      if(d<CFG.pickupRadius+CFG.playerRadius){ collect(p); G.pickups.splice(i,1); }
+    }
+    // 脱出チャネル
+    if(channeling){ G.channel=Math.min(CFG.channelTime,G.channel+dt); if(G.channel>=CFG.channelTime) bank(); }
+    else { G.channel=Math.max(0,G.channel-dt*2); }
+
+    // 演出
+    for(let i=G.popups.length-1;i>=0;i--){ const p=G.popups[i]; p.y+=p.vy*dt; p.life-=dt; if(p.life<=0)G.popups.splice(i,1); }
+    for(let i=G.parts.length-1;i>=0;i--){ const p=G.parts[i]; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vx*=0.92; p.vy*=0.92; p.life-=dt; if(p.life<=0)G.parts.splice(i,1); }
+    if(G.shake>0) G.shake=Math.max(0,G.shake-dt*40);
+    if(G.hurtFlash>0) G.hurtFlash-=dt;
+  }
+
+  // ===== 描画 =====
+  function drawGrid(){
+    ctx.strokeStyle=COL.grid; ctx.lineWidth=1; const g=46;
+    ctx.beginPath();
+    for(let x=0;x<=W;x+=g){ ctx.moveTo(x,0); ctx.lineTo(x,H); }
+    for(let y=0;y<=H;y+=g){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
+    ctx.stroke();
+  }
+  function vignette(){
+    const g=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.3,W/2,H/2,Math.max(W,H)*0.72);
+    g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(1,'rgba(0,0,0,0.55)');
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+    if(G.riskT>0.05){ const r=G.riskT*0.5; ctx.fillStyle='rgba(255,40,40,'+(0.16*r).toFixed(3)+')'; ctx.fillRect(0,0,W,H); }
+  }
+  function dot(x,y,r,c,glow){ ctx.save(); if(glow){ctx.shadowColor=c;ctx.shadowBlur=glow;} ctx.fillStyle=c; ctx.beginPath(); ctx.arc(x,y,r,0,6.2832); ctx.fill(); ctx.restore(); }
+  function diamond(x,y,r,c,glow){ ctx.save(); if(glow){ctx.shadowColor=c;ctx.shadowBlur=glow;} ctx.fillStyle=c; ctx.translate(x,y); ctx.rotate(Math.PI/4); ctx.fillRect(-r,-r,r*2,r*2); ctx.restore(); }
+
+  function drawHUD(){
+    const pad=14;
+    // HP
+    const hw=Math.min(W*0.34,240), hh=12;
+    ctx.fillStyle='rgba(255,255,255,0.12)'; rrect(pad,pad,hw,hh,6); ctx.fill();
+    const hp=G.hp/CFG.playerMaxHp; ctx.fillStyle=hp>0.4?COL.good:COL.bad; rrect(pad,pad,hw*hp,hh,6); ctx.fill();
+    ctx.fillStyle='#cfe0ff'; ctx.font='11px sans-serif'; ctx.textAlign='left'; ctx.fillText('HP',pad,pad+hh+13);
+    // RISK pips
+    ctx.textAlign='center'; ctx.font='bold 12px sans-serif'; ctx.fillStyle='#cfe0ff';
+    ctx.fillText('RISK',W/2,pad+10);
+    const pr=7,gap=8,total=5*(pr*2)+4*gap, sx=W/2-total/2+pr;
+    for(let i=0;i<5;i++){ const on=i<G.stage; const c=i<2?COL.common:(i<4?COL.warn:COL.bad);
+      ctx.fillStyle=on?c:'rgba(255,255,255,0.14)'; ctx.beginPath(); ctx.arc(sx+i*(pr*2+gap),pad+26,pr,0,6.2832); ctx.fill(); }
+    if(G.stage>=CFG.hunterStage && Math.floor(G.survival*3)%2===0){ ctx.fillStyle=COL.hunter; ctx.font='bold 12px sans-serif'; ctx.fillText('⚠ HUNTER',W/2,pad+46); }
+    // UNBANKED（失う額を強調）
+    ctx.textAlign='right'; const big=G.unbanked>0;
+    ctx.fillStyle='#9fb3d0'; ctx.font='11px sans-serif'; ctx.fillText('UNBANKED（死ぬと失う）',W-pad,pad+8);
+    ctx.fillStyle=big?COL.rare:'#5f6f86'; ctx.font='bold 30px sans-serif'; ctx.fillText(String(G.unbanked),W-pad,pad+40);
+    ctx.fillStyle='#7f8fa6'; ctx.font='11px sans-serif'; ctx.fillText('BANKED total '+store.total,W-pad,pad+58);
+  }
+  function rrect(x,y,w,h,r){ r=Math.min(r,h/2,w/2); ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+  function drawButtons(){
+    const g=btnGeom();
+    // EXTRACT
+    const prog=G.channel/CFG.channelTime, pulse=(G.unbanked>0&&prog<=0)?(0.5+0.5*Math.sin(G.survival*6)):1;
+    ctx.save(); ctx.globalAlpha=0.9;
+    ctx.fillStyle='rgba(70,240,138,'+(0.10+0.12*pulse).toFixed(3)+')'; dotPath(g.ex,g.ey,g.r1); ctx.fill();
+    ctx.lineWidth=4; ctx.strokeStyle='rgba(70,240,138,0.45)'; dotPath(g.ex,g.ey,g.r1); ctx.stroke();
+    if(prog>0){ ctx.lineWidth=6; ctx.strokeStyle=COL.good; ctx.beginPath(); ctx.arc(g.ex,g.ey,g.r1,-1.5708,-1.5708+prog*6.2832); ctx.stroke(); }
+    ctx.fillStyle='#dffaeb'; ctx.textAlign='center'; ctx.font='bold 13px sans-serif'; ctx.fillText('EXTRACT',g.ex,g.ey-2); ctx.font='10px sans-serif'; ctx.fillText('長押し',g.ex,g.ey+13);
+    ctx.restore();
+    // DASH
+    const cd=clamp(G.dashCdT/CFG.dashCd,0,1);
+    ctx.save(); ctx.globalAlpha=cd>0?0.5:0.9;
+    ctx.fillStyle='rgba(70,224,255,0.12)'; dotPath(g.dx,g.dy,g.r2); ctx.fill();
+    ctx.lineWidth=3; ctx.strokeStyle='rgba(70,224,255,0.5)'; dotPath(g.dx,g.dy,g.r2); ctx.stroke();
+    if(cd>0){ ctx.lineWidth=5; ctx.strokeStyle='rgba(70,224,255,0.9)'; ctx.beginPath(); ctx.arc(g.dx,g.dy,g.r2,-1.5708,-1.5708+(1-cd)*6.2832); ctx.stroke(); }
+    ctx.fillStyle='#dff5ff'; ctx.textAlign='center'; ctx.font='bold 12px sans-serif'; ctx.fillText('DASH',g.dx,g.dy+4);
+    ctx.restore();
+  }
+  function dotPath(x,y,r){ ctx.beginPath(); ctx.arc(x,y,r,0,6.2832); }
+
+  function drawJoystick(){
+    if(!joy.active) return;
+    ctx.save(); ctx.globalAlpha=0.6;
+    ctx.strokeStyle='rgba(255,255,255,0.25)'; ctx.lineWidth=3; ctx.beginPath(); ctx.arc(joy.ox,joy.oy,MAXR,0,6.2832); ctx.stroke();
+    ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.beginPath(); ctx.arc(joy.ox+joy.x*MAXR,joy.oy+joy.y*MAXR,22,0,6.2832); ctx.fill();
+    ctx.restore();
+  }
+
+  function overlay(title,titleColor,lines,cta){
+    ctx.fillStyle='rgba(5,8,14,0.72)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.fillStyle=titleColor; ctx.font='bold 40px sans-serif'; ctx.fillText(title,W/2,H*0.30);
+    ctx.fillStyle='#cfe0ff'; ctx.font='15px sans-serif';
+    let y=H*0.30+40; for(const l of lines){ ctx.fillText(l,W/2,y); y+=24; }
+    ctx.font='bold 16px sans-serif'; ctx.fillStyle='#9fe7ff'; ctx.fillText(cta,W/2,H*0.78);
+  }
+
+  function render(){
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    ctx.clearRect(0,0,W,H);
+    // 画面シェイク
+    let sx=0,sy=0; if(G.shake>0){ sx=(Math.random()*2-1)*G.shake; sy=(Math.random()*2-1)*G.shake; }
+    ctx.save(); ctx.translate(sx,sy);
+
+    drawGrid();
+    // pickups
+    for(const p of G.pickups){ const pulse=p.rare?(1+0.18*Math.sin((p.t)*8)):1; diamond(p.x,p.y,(p.rare?7:5)*pulse,p.rare?COL.rare:COL.common,p.rare?14:6); }
+    // bullets
+    for(const b of G.bullets) dot(b.x,b.y,CFG.bulletRadius,COL.bullet,8);
+    // enemies
+    for(const e of G.enemies){ const c=e.flash>0?'#ffffff':(e.hunter?COL.hunter:COL.enemy); dot(e.x,e.y,e.r,c,e.hunter?14:6);
+      if(e.hunter){ ctx.strokeStyle='rgba(255,92,240,0.6)'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(e.x,e.y,e.r+4,0,6.2832); ctx.stroke(); } }
+    // player
+    ctx.save(); if(G.iframeT>0 && Math.floor(G.survival*30)%2===0) ctx.globalAlpha=0.4;
+    ctx.shadowColor=COL.player; ctx.shadowBlur=12; ctx.fillStyle=COL.player;
+    const r=CFG.playerRadius; rrect(G.px-r,G.py-r,r*2,r*2,5); ctx.fill(); ctx.restore();
+    // channel ring around player
+    if(G.channel>0){ const pr=G.channel/CFG.channelTime; ctx.strokeStyle=COL.good; ctx.lineWidth=4; ctx.beginPath(); ctx.arc(G.px,G.py,r+12,-1.5708,-1.5708+pr*6.2832); ctx.stroke(); }
+    // particles
+    for(const p of G.parts){ ctx.globalAlpha=Math.max(0,p.life/p.max); dot(p.x,p.y,3,p.color,0); } ctx.globalAlpha=1;
+    // popups
+    ctx.textAlign='center'; ctx.font='bold 15px sans-serif';
+    for(const p of G.popups){ ctx.globalAlpha=Math.max(0,p.life/p.max); ctx.fillStyle=p.color; ctx.fillText(p.text,p.x,p.y); } ctx.globalAlpha=1;
+
+    ctx.restore(); // end shake
+
+    vignette();
+    if(G.hurtFlash>0){ ctx.fillStyle='rgba(255,40,40,'+(G.hurtFlash*2).toFixed(3)+')'; ctx.fillRect(0,0,W,H); }
+
+    if(G.mode==='playing'){ drawHUD(); drawButtons(); drawJoystick(); }
+    else if(G.mode==='title'){
+      overlay('BIT VITALS','#9fe7ff',
+        ['白い四角＝あなた。素材を拾うほど UNBANKED が増える。','EXTRACT 長押しで“確定”。死ぬと UNBANKED の大半を失う。','左ドラッグ＝移動 / WASD・矢印、DASH、長押しEXTRACT',
+         store.total>0?('career banked '+store.total+'  /  best '+store.best):''],
+        'タップ / Space でダイブ');
+    } else if(G.mode==='result'){
+      const win=G.outcome==='banked';
+      overlay(win?'EXTRACTED!':'DOWNED', win?COL.good:COL.bad,
+        win?['BANKED  +'+G.thisBanked, '生存 '+G.survival.toFixed(1)+'s  /  到達Risk '+G.maxStage,
+             'career '+store.total+'  /  best '+store.best]
+           :['LOST  -'+G.thisLost+'   (kept '+G.thisBanked+')', '生存 '+G.survival.toFixed(1)+'s  /  到達Risk '+G.maxStage,
+             'career '+store.total+'  /  best '+store.best],
+        'タップ / Space でもう一度');
+    }
+  }
+
+  // ===== メインループ =====
+  let last=0;
+  function frame(t){ const dt=Math.min(0.05,(t-last)/1000||0); last=t; update(dt); render(); requestAnimationFrame(frame); }
+  resize(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
