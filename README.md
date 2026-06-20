@@ -1,3 +1,12 @@
+# プロトタイプ置き場
+
+このリポジトリには白図形の遊べる検証用モックを置いています（いずれも本番ではありません）。
+
+- 🆕 **Turf Commander（陣取りコマンダー・仮）** ▶ https://ryogaaaaaaaaaaa.github.io/bit-vital/turf/ — 3分のリアルタイム陣取り。メイン1機を操作＋サブ2機に方針を出す「指揮官」プロト。詳細は [turf/README.md](turf/README.md)。
+- **Bit Vitals（棚上げ）** ▶ https://ryogaaaaaaaaaaa.github.io/bit-vital/ — 下記。
+
+---
+
 # Bit Vitals — M0 プレイアブル・モック
 
 「**bank or push（確定するか、欲張るか）**」が面白いかを白い図形で確かめる、単一HTML（Canvas+JS）の遊べる検証用モック。**本番ではありません**（本番は Godot で実装予定）。
